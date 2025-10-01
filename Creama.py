@@ -6,7 +6,103 @@ import serial
 import threading
 import time
 import serial.tools.list_ports
+from typing import Tuple
 from pyzbar.pyzbar import decode
+
+
+def _ellipse_kernel(size: int = 5) -> np.ndarray:
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+
+
+def _preprocess_circular_features(frame: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """利用增强+梯度算子突出掩膜区域里的圆形边缘，为霍夫圆提供输入。"""
+    masked_frame = cv2.bitwise_and(frame, frame, mask=mask)
+    gray = cv2.cvtColor(masked_frame, cv2.COLOR_BGR2GRAY)
+
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    equalized = clahe.apply(gray)
+
+    gradient = cv2.morphologyEx(equalized, cv2.MORPH_GRADIENT, _ellipse_kernel(5))
+    blurred = cv2.GaussianBlur(gradient, (7, 7), 0)
+
+    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, _ellipse_kernel(5), iterations=1)
+    binary = cv2.bitwise_and(binary, mask)
+
+    if DEBUG_VISUAL:
+        cv2.imshow("masked_gray", gray)
+        cv2.imshow("gradient", gradient)
+        cv2.imshow("binary", binary)
+
+    return masked_frame, gray, binary
+
+
+def _mask_coverage_ratio(mask: np.ndarray, cx: int, cy: int, radius: int) -> float:
+    """评估圆形候选与颜色掩膜的重叠比例，越接近1表示越符合目标区域。"""
+    radius = int(max(1, radius))
+    h, w = mask.shape[:2]
+    if not (0 <= cx < w and 0 <= cy < h):
+        return 0.0
+
+    circle_mask = np.zeros_like(mask)
+    cv2.circle(circle_mask, (cx, cy), radius, 255, -1)
+    overlap_pixels = cv2.countNonZero(cv2.bitwise_and(mask, circle_mask))
+    circle_area = np.pi * radius * radius
+    if circle_area <= 1e-5:
+        return 0.0
+    return overlap_pixels / circle_area
+
+
+def _pick_best_circle(binary: np.ndarray, cleaned_mask: np.ndarray, params: dict):
+    """
+    仅通过霍夫圆检测选择最佳圆形目标，避免基于轮廓面积的判别。
+    """
+    min_radius = params.get("min_radius", 12)
+    max_radius = params.get("max_radius", 60)
+    min_mask_ratio = params.get("min_mask_ratio", 0.45)
+
+    best_result = None
+    best_score = -np.inf
+
+    try:
+        # `cv2.HOUGH_GRADIENT_ALT` 对圆环/凸台边缘更敏感，适合检测高亮边缘
+        circles = cv2.HoughCircles(
+            binary,
+            cv2.HOUGH_GRADIENT_ALT,
+            dp=1.2,
+            minDist=40,
+            param1=120,
+            param2=0.4,
+            minRadius=min_radius,
+            maxRadius=max_radius,
+        )
+    except cv2.error:
+        circles = None
+
+    if circles is None or len(circles) == 0:
+        return None
+
+    h, w = cleaned_mask.shape[:2]
+    for cx, cy, radius in np.uint16(np.around(circles[0])):
+        if radius < min_radius or radius > max_radius:
+            continue
+        cx_i, cy_i = int(cx), int(cy)
+        if not (0 <= cx_i < w and 0 <= cy_i < h):
+            continue
+        if cleaned_mask[cy_i, cx_i] == 0:
+            continue
+        coverage = _mask_coverage_ratio(cleaned_mask, cx_i, cy_i, int(radius))
+        # coverage < 0.45 表示圆形与颜色掩膜重叠过少，可能是噪声或背景圆
+        if coverage < min_mask_ratio:
+            continue
+        # 综合考虑覆盖比例与半径，覆盖比优先级更高
+        score = coverage * 100 + radius
+        contour = cv2.ellipse2Poly((cx_i, cy_i), (int(radius), int(radius)), 0, 0, 360, 10)
+        if score > best_score:
+            best_score = score
+            best_result = ((cx_i, cy_i), int(radius), contour, coverage)
+
+    return best_result
 
 # -------------------- 调试开关 --------------------
 DEBUG_VISUAL = False  # 显示中间图像、掩膜等调试窗口
@@ -131,12 +227,61 @@ serial_thread = threading.Thread(target=uart_process)
 serial_thread.daemon = True
 serial_thread.start()
 
-PLATFORM_AREA_MIN = 20000  # 凸台最小面积
-PLATFORM_AREA_MAX = 48000  # 凸台最大面积
-SLOT_AREA_MIN = 34000      # 凹槽最小面积
-SLOT_AREA_MAX = 60000      # 凹槽最大面积
-BLOCK_AREA_MIN= 32000      # 物块最小面积
-BLOCK_AREA_MAX= 58000      # 物块最大面积
+CIRCULAR_TARGET_PARAMS = {
+    # 统一视作圆形目标，通过霍夫圆检测识别凸台/凹槽
+    "COMMON": {
+        # 默认像素半径范围，后续会根据掩膜面积自适应压缩
+        "min_radius": 12,
+        "max_radius": 80,
+        "min_mask_ratio": 0.45,
+    },
+    # 若后续需要估算堆叠底座，可按需调整半径范围
+    "STACK_BASE": {
+        # 堆叠底座略小，因此提供更窄的初始范围
+        "min_radius": 10,
+        "max_radius": 70,
+        "min_mask_ratio": 0.45,
+    },
+}
+
+ENABLE_RADIUS_ADAPT = True  # 可通过测试脚本关闭自适应
+RADIUS_MARGIN_SCALE = 0.5   # 掩膜估算半径的涨幅比例，可调节收敛速度
+
+
+def _get_circular_params(target_type: str) -> dict:
+    key = "STACK_BASE" if target_type == "STACK_BASE" else "COMMON"
+    return dict(CIRCULAR_TARGET_PARAMS[key])
+
+
+def _adjust_radius_params(params: dict, cleaned_mask: np.ndarray) -> dict:
+    """
+    根据掩膜面积估算像素半径，使霍夫圆搜索范围贴合当前视距。
+    避免手动调大半径导致目标被过滤掉。
+    """
+    if not ENABLE_RADIUS_ADAPT:
+        return params
+
+    mask_pixels = cv2.countNonZero(cleaned_mask)
+    if mask_pixels <= 50:  # 掩膜过少，不足以估算
+        return params
+
+    base_radius = np.sqrt(mask_pixels / np.pi)  # 用面积反推等效半径
+    margin = max(4.0, base_radius * float(RADIUS_MARGIN_SCALE))
+    min_radius = max(6, int(base_radius - margin))
+    max_radius = min(200, int(base_radius + margin))
+    if max_radius - min_radius < 6:
+        max_radius = min(200, min_radius + 6)
+
+    params["min_radius"] = min_radius
+    params["max_radius"] = max_radius
+
+    if DEBUG_LOG:
+        log_debug(
+            f"[radius-adapt] mask_pixels={mask_pixels} base={base_radius:.1f}"
+            f" range=({min_radius}, {max_radius})"
+        )
+
+    return params
 
 # --- HSV颜色阈值 ---
 color_thresholds = {'red': {'Lower1': np.array([170, 43, 46]), 'Upper1': np.array([180, 255, 255]),'Lower2': np.array([0, 80, 80]), 'Upper2': np.array([20, 255, 255])},
@@ -237,6 +382,7 @@ def color_blocks_position_WL(img, color, size_code, output_img):
 def find_specific_target(frame, color_to_find, target_type):
     """
     根据指定的颜色和目标类型，寻找唯一的目标。
+    整体流程：颜色分割 → 形态学去噪 → 边缘增强 → 霍夫圆筛选。
     :param frame: 摄像头画面
     :param color_to_find: 'red', 'green', 或 'blue'
     :param target_type: 'PLATFORM', 'SLOT', 或 'STACK_BASE'
@@ -262,47 +408,35 @@ def find_specific_target(frame, color_to_find, target_type):
         mask = cv2.inRange(hsv_frame, lower_hsv, upper_hsv)
 
     # 步骤 3: 形态学处理 - 去除噪点
+    # 仅保留颜色块主体，避免霍夫圆被散噪触发
     kernel = np.ones((5, 5), np.uint8)
     # 使用开运算去除小的噪点
     cleaned_mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     # 可以选择性地再加一个闭运算来填充物体内部的小洞
     cleaned_mask = cv2.morphologyEx(cleaned_mask, cv2.MORPH_CLOSE, kernel)
     
-    contours, _ = cv2.findContours(cleaned_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    _, _, binary = _preprocess_circular_features(frame, cleaned_mask)
+    params = _get_circular_params(target_type)
+    params = _adjust_radius_params(params, cleaned_mask)
+    # 不再区分凸台/凹槽，统一按圆形检测，参数组只控制半径区间
+    best = _pick_best_circle(binary, cleaned_mask, params)
+    if not best:
+        return None
 
-    # 步骤 4: 根据“状态值”(target_type) 进行精确过滤
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        
-        # 计算中心点
-        M = cv2.moments(cnt)
-        if M["m00"] == 0: continue
-        cx = int(M["m10"] / M["m00"])
-        cy = int(M["m01"] / M["m00"])
+    (cx, cy), radius, contour, coverage = best
 
-        if DEBUG_VISUAL:
-            cv2.circle(frame, (cx, cy), 3, (255, 255, 255), -1)
+    log_debug(
+        f"{color_to_find} {target_type.lower()} circle r={radius} cov={coverage:.2f}"
+        f" center=({cx}, {cy})"
+    )
 
-        # 核心逻辑：根据状态值选择不同的判断标准
-        if target_type == "PLATFORM":
-            if PLATFORM_AREA_MIN < area < PLATFORM_AREA_MAX:
-                log_debug(f"{color_to_find} platform area={area:.0f} center=({cx}, {cy})")
-                return ((cx, cy), cnt)  # 找到了！返回中心点和轮廓
+    if DEBUG_VISUAL:
+        debug_frame = frame.copy()
+        cv2.circle(debug_frame, (cx, cy), radius, (0, 255, 255), 2)
+        cv2.circle(debug_frame, (cx, cy), 5, (0, 255, 0), -1)
+        cv2.imshow("circular_target", debug_frame)
 
-        elif target_type == "SLOT":
-            if SLOT_AREA_MIN < area < SLOT_AREA_MAX:
-                log_debug(f"{color_to_find} slot area={area:.0f} center=({cx}, {cy})")
-                return ((cx, cy), cnt)  # 找到了！返回中心点和轮廓
-
-        elif target_type == "STACK_BASE":
-            # 寻找码垛基座（已放置的物块）的逻辑会更复杂一些
-            # 简单版本：它的面积应该和物块面积接近
-            if BLOCK_AREA_MIN < area < BLOCK_AREA_MAX:
-                # 这里还可以增加判断，比如它是否在一个凹槽的轮廓内部
-                log_debug(f"{color_to_find} stack area={area:.0f} center=({cx}, {cy})")
-                return ((cx, cy), cnt)  # 找到了！返回中心点和轮廓
-
-    return None # 如果循环结束还没找到，就返回None
+    return ((cx, cy), contour)
 
 def detect_platforms(frame):
     """
