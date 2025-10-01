@@ -8,52 +8,21 @@ import time
 import serial.tools.list_ports
 from pyzbar.pyzbar import decode
 
+# -------------------- 调试开关 --------------------
+DEBUG_VISUAL = False  # 显示中间图像、掩膜等调试窗口
+DEBUG_LOG = True      # 在终端打印调试信息
+
+
+def log_debug(message):
+    """根据开关打印调试信息，避免无关输出刷屏。"""
+    if DEBUG_LOG:
+        print(message)
+
 # 定义串口接收和串口发送数组以及标志码unit任务码unit_target
 receive = [0, 0, 0, 0]
 send = [0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x77]
 unit = 0
 unit_target = 0
-
-# 创建串口进程函数
-def uart_process():
-    global receive, unit, unit_target
-    
-    while True:
-        input_data = ser.read(4)
-        com_input = list(input_data)
-        if com_input:  # 如果读取结果非空，则输出
-            print(com_input)
-            try:
-                receive[0] = int(com_input[0])
-                receive[1] = int(com_input[1])
-                receive[2] = int(com_input[2])
-                receive[3] = int(com_input[3])
-            except:
-                receive = [0, 0, 0, 0]
-            print(receive)
-            if receive[0] == 102:  # 0x66
-                unit = receive[1]
-                unit_target = receive[2]
-
-# 直接创建串口对象 
-ser = serial.Serial(port="COM3", baudrate=115200, timeout=0.05)
-serial_thread = threading.Thread(target=uart_process)
-serial_thread.daemon = True
-serial_thread.start()
-
-PLATFORM_AREA_MIN = 20000  # 凸台最小面积
-PLATFORM_AREA_MAX = 48000  # 凸台最大面积
-SLOT_AREA_MIN = 34000      # 凹槽最小面积
-SLOT_AREA_MAX = 60000      # 凹槽最大面积
-BLOCK_AREA_MIN= 32000      # 物块最小面积
-BLOCK_AREA_MAX= 58000      # 物块最大面积
-
-# --- HSV颜色阈值 ---
-color_thresholds = {'red': {'Lower1': np.array([170, 43, 46]), 'Upper1': np.array([180, 255, 255]),'Lower2': np.array([0, 80, 80]), 'Upper2': np.array([20, 255, 255])},
-              'blue': {'Lower': np.array([100, 140, 110]), 'Upper': np.array([124, 255, 255])},
-              'green': {'Lower': np.array([38, 100, 60]), 'Upper': np.array([90, 255, 255])},
-              }
-
 
 # 从这里开始到93行都是卡尔曼滤波算法的初始化步骤
 kalman = cv2.KalmanFilter(2, 2)
@@ -135,6 +104,46 @@ def kalman_filter_3(measured_value):
 
     return current_prediction_3
 
+# 创建串口进程函数
+def uart_process():
+    global receive, unit, unit_target
+    
+    while True:
+        input_data = ser.read(4)
+        com_input = list(input_data)
+        if com_input:  # 如果读取结果非空，则输出
+            log_debug(com_input)
+            try:
+                receive[0] = int(com_input[0])
+                receive[1] = int(com_input[1])
+                receive[2] = int(com_input[2])
+                receive[3] = int(com_input[3])
+            except:
+                receive = [0, 0, 0, 0]
+            log_debug(receive)
+            if receive[0] == 102:  # 0x66
+                unit = receive[1]
+                unit_target = receive[2]
+
+# 直接创建串口对象 
+ser = serial.Serial(port="/dev/ttyS3", baudrate=115200, timeout=0.05)
+serial_thread = threading.Thread(target=uart_process)
+serial_thread.daemon = True
+serial_thread.start()
+
+PLATFORM_AREA_MIN = 20000  # 凸台最小面积
+PLATFORM_AREA_MAX = 48000  # 凸台最大面积
+SLOT_AREA_MIN = 34000      # 凹槽最小面积
+SLOT_AREA_MAX = 60000      # 凹槽最大面积
+BLOCK_AREA_MIN= 32000      # 物块最小面积
+BLOCK_AREA_MAX= 58000      # 物块最大面积
+
+# --- HSV颜色阈值 ---
+color_thresholds = {'red': {'Lower1': np.array([170, 43, 46]), 'Upper1': np.array([180, 255, 255]),'Lower2': np.array([0, 80, 80]), 'Upper2': np.array([20, 255, 255])},
+              'blue': {'Lower': np.array([100, 140, 110]), 'Upper': np.array([124, 255, 255])},
+              'green': {'Lower': np.array([38, 100, 60]), 'Upper': np.array([90, 255, 255])},
+              }
+
 # 定义一个函数，用于对检测到的二维码角点进行排序
 def sort_points(pts):
     if pts is None or len(pts) == 0:
@@ -174,64 +183,56 @@ def display(img, bbox):
     # 绘制中心点
     cv2.circle(img, (center_x, center_y), 5, (0, 255, 0), -1)
 
-def color_blocks_position_WL (img, color, size_code, output_img):
-    """
-    根据命令借助HSV颜色阈值筛选识别指定的物料
-    :param img: 输入的图像
-    :param color: 要追踪的颜色目标对象（RGB）
-    :param size_code: 颜色色块面积限幅（用于灵活筛选追踪颜色大小）
-    :param output_img: 用于绘制轮廓和点的输出图像
-    :return: 相应色块的中心坐标
-    """
-    # 定义颜色识别阈值（HSV）
-    color_dist = {'red': {'Lower1': np.array([170, 43, 46]), 'Upper1': np.array([180, 255, 255]),'Lower2': np.array([0, 43, 46]), 'Upper2': np.array([10, 255, 255])},
-              'blue': {'Lower': np.array([100, 140, 110]), 'Upper': np.array([124, 255, 255])},
-              'green': {'Lower': np.array([38, 100, 60]), 'Upper': np.array([90, 255, 255])},
-              }
-    ball_color = color
-    if img is not None:
-        gs_img = cv2.GaussianBlur(img, (5, 5), 0)                     # 高斯模糊
-        hsv_img = cv2.cvtColor(gs_img, cv2.COLOR_BGR2HSV)                 # 转化成HSV图像
-        erode_hsv = cv2.erode(hsv_img, None, iterations=2)                   # 腐蚀 粗的变细（平整边缘）
-        dilate_hsv = cv2.dilate(erode_hsv, None, iterations=2)               # 膨胀 细的变粗（连接断开区域）
-        inRange_hsv = None
-        # 红色在HSV空间阈值有两部分所以需要特殊处理
-        if (ball_color == 'red'):
-            inRange_hsv1 = cv2.inRange(dilate_hsv, color_dist[ball_color]['Lower1'], color_dist[ball_color]['Upper1'])
-            res1 = cv2.bitwise_and(dilate_hsv, dilate_hsv, mask=inRange_hsv1)
-            inRange_hsv2 = cv2.inRange(dilate_hsv, color_dist[ball_color]['Lower2'], color_dist[ball_color]['Upper2'])
-            res2 = cv2.bitwise_and(dilate_hsv, dilate_hsv, mask=inRange_hsv2)
-            inRange_hsv = inRange_hsv1 + inRange_hsv2
-        else:
-            inRange_hsv = cv2.inRange(dilate_hsv, color_dist[ball_color]['Lower'], color_dist[ball_color]['Upper'])
-        # cv2.imshow("end2",dilate_hsv) # 移除中间图像显示
-        # cv2.imshow("end",inRange_hsv) # 移除中间图像显示
-        cnts = cv2.findContours(inRange_hsv.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]# 找角点
-        
-        if len(cnts) > 0:
-            c = max(cnts, key=cv2.contourArea)# 筛选面积最大的色块
-            size = int(cv2.contourArea(c))
+def color_blocks_position_WL(img, color, size_code, output_img):
+    """借鉴开源逻辑的颜色块定位，增加平滑及可选调试输出。"""
+    if img is None:
+        log_debug("无画面，跳过颜色检测")
+        return None
 
-            if (size > size_code): # 面积限幅
-                print(f"检测到的大轮廓面积: {size}")
-                rect = cv2.minAreaRect(c)
-                box = cv2.boxPoints(rect)
-                # 在绘制之前检查box的有效性
-                if box is not None and len(box) > 0:
-                    cv2.drawContours(output_img, [np.int_(box)], -1, (0, 0, 255), 2)
-                
-                center_x, center_y = rect[0]
-                print(f"绘制轮廓并返回中心坐标: ({int(center_x)}, {int(center_y)})")
-                return (int(center_x), int(center_y)) # 返回相应色块的中心坐标
-            else:
-                # 面积不满足时不打印信息，避免刷屏
-                pass
-        else:
-            print("未检测到任何轮廓。")
-            pass
+    color_dist = {
+        'red': {
+            'Lower1': np.array([170, 43, 46]), 'Upper1': np.array([180, 255, 255]),
+            'Lower2': np.array([0, 43, 46]), 'Upper2': np.array([10, 255, 255])
+        },
+        'blue': {'Lower': np.array([100, 140, 110]), 'Upper': np.array([124, 255, 255])},
+        'green': {'Lower': np.array([38, 100, 60]), 'Upper': np.array([90, 255, 255])},
+    }
+
+    blurred = cv2.GaussianBlur(img, (5, 5), 0)
+    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+    eroded = cv2.erode(hsv, None, iterations=2)
+    dilated = cv2.dilate(eroded, None, iterations=2)
+
+    if color == 'red':
+        mask1 = cv2.inRange(dilated, color_dist['red']['Lower1'], color_dist['red']['Upper1'])
+        mask2 = cv2.inRange(dilated, color_dist['red']['Lower2'], color_dist['red']['Upper2'])
+        mask = cv2.add(mask1, mask2)
     else:
-        print("无画面")
-    return None # 如果没有检测到物块，返回 None
+        mask = cv2.inRange(dilated, color_dist[color]['Lower'], color_dist[color]['Upper'])
+
+    if DEBUG_VISUAL:
+        cv2.imshow(f"mask_{color}", mask)
+
+    contours = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
+    if not contours:
+        return None
+
+    best_cnt = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(best_cnt)
+    if area <= size_code:
+        return None
+
+    rect = cv2.minAreaRect(best_cnt)
+    box = cv2.boxPoints(rect)
+    box = np.int_(box)
+    cx, cy = rect[0]
+
+    if DEBUG_VISUAL:
+        cv2.drawContours(output_img, [box], -1, (0, 0, 255), 2)
+        cv2.circle(output_img, (int(cx), int(cy)), 3, (0, 0, 255), -1)
+
+    log_debug(f"{color} block area={area:.0f} center=({int(cx)}, {int(cy)})")
+    return int(cx), int(cy)
 
 def find_specific_target(frame, color_to_find, target_type):
     """
@@ -279,21 +280,27 @@ def find_specific_target(frame, color_to_find, target_type):
         cx = int(M["m10"] / M["m00"])
         cy = int(M["m01"] / M["m00"])
 
+        if DEBUG_VISUAL:
+            cv2.circle(frame, (cx, cy), 3, (255, 255, 255), -1)
+
         # 核心逻辑：根据状态值选择不同的判断标准
         if target_type == "PLATFORM":
             if PLATFORM_AREA_MIN < area < PLATFORM_AREA_MAX:
-                return ((cx, cy), cnt) # 找到了！返回中心点和轮廓
+                log_debug(f"{color_to_find} platform area={area:.0f} center=({cx}, {cy})")
+                return ((cx, cy), cnt)  # 找到了！返回中心点和轮廓
 
         elif target_type == "SLOT":
             if SLOT_AREA_MIN < area < SLOT_AREA_MAX:
-                return ((cx, cy), cnt) # 找到了！返回中心点和轮廓
+                log_debug(f"{color_to_find} slot area={area:.0f} center=({cx}, {cy})")
+                return ((cx, cy), cnt)  # 找到了！返回中心点和轮廓
 
         elif target_type == "STACK_BASE":
             # 寻找码垛基座（已放置的物块）的逻辑会更复杂一些
             # 简单版本：它的面积应该和物块面积接近
             if BLOCK_AREA_MIN < area < BLOCK_AREA_MAX:
                 # 这里还可以增加判断，比如它是否在一个凹槽的轮廓内部
-                return ((cx, cy), cnt) # 找到了！返回中心点和轮廓
+                log_debug(f"{color_to_find} stack area={area:.0f} center=({cx}, {cy})")
+                return ((cx, cy), cnt)  # 找到了！返回中心点和轮廓
 
     return None # 如果循环结束还没找到，就返回None
 
@@ -310,13 +317,14 @@ def detect_platforms(frame):
             platform_result = find_specific_target(frame, color, 'PLATFORM')
             if platform_result:
                 platform_pos, platform_contour = platform_result
-                cv2.drawContours(frame, [platform_contour], -1, (0, 255, 255), 2) # 绘制轮廓
-                cv2.putText(frame, f"{color.capitalize()} Platform", (platform_pos[0] + 10, platform_pos[1]), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                print(f"检测到 {color} 凸台，中心坐标: {platform_pos}")
+                if DEBUG_VISUAL:
+                    cv2.drawContours(frame, [platform_contour], -1, (0, 255, 255), 2)
+                    cv2.putText(frame, f"{color.capitalize()} Platform", (platform_pos[0] + 10, platform_pos[1]),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                log_debug(f"检测到 {color} 凸台，中心坐标: {platform_pos}")
                 platform_positions.append(platform_pos)
     except Exception as e:
-        print(f"处理凸台检测时发生错误: {e}")
+        log_debug(f"处理凸台检测时发生错误: {e}")
     return platform_positions
 
 def detect_slots(frame):
@@ -332,13 +340,14 @@ def detect_slots(frame):
             slot_result = find_specific_target(frame, color, 'SLOT')
             if slot_result:
                 slot_pos, slot_contour = slot_result
-                cv2.drawContours(frame, [slot_contour], -1, (255, 255, 0), 2) # 绘制轮廓
-                cv2.putText(frame, f"{color.capitalize()} Slot", (slot_pos[0] + 10, slot_pos[1]), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                print(f"检测到 {color} 凹槽，中心坐标: {slot_pos}")
+                if DEBUG_VISUAL:
+                    cv2.drawContours(frame, [slot_contour], -1, (255, 255, 0), 2)
+                    cv2.putText(frame, f"{color.capitalize()} Slot", (slot_pos[0] + 10, slot_pos[1]),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                log_debug(f"检测到 {color} 凹槽，中心坐标: {slot_pos}")
                 slot_positions.append(slot_pos)
     except Exception as e:
-        print(f"处理凹槽检测时发生错误: {e}")
+        log_debug(f"处理凹槽检测时发生错误: {e}")
     return slot_positions
 
 if __name__ == "__main__":
@@ -356,16 +365,21 @@ if __name__ == "__main__":
                     if platform_positions:
                         # 取第一个检测到的凸台作为物料盘中心
                         center_x, center_y = platform_positions[0]
-                        
+                        # 使用卡尔曼滤波平滑中心坐标
+                        measurement = np.array([[center_x], [center_y]], dtype=np.float32)
+                        prediction = kalman_filter(measurement)
+                        qx0 = int(prediction[0][0])
+                        qy0 = int(prediction[1][0])
+
                         send[1] = 0x01
-                        send[2] = (center_x & 0xff00) >> 8
-                        send[3] = (center_x & 0xff)
-                        send[4] = (center_y & 0xff00) >> 8
-                        send[5] = (center_y & 0xff)
+                        send[2] = (qx0 & 0xff00) >> 8
+                        send[3] = (qx0 & 0xff)
+                        send[4] = (qy0 & 0xff00) >> 8
+                        send[5] = (qy0 & 0xff)
                         send[6] = 0x77
                         FH = bytearray(send)
                         write_len = ser.write(FH)
-                        print(f"物料盘中心坐标: ({center_x}, {center_y})")
+                        print(f"物料盘中心坐标: ({qx0}, {qy0})")
                         print(send)
                 except:
                     pass
@@ -378,7 +392,12 @@ if __name__ == "__main__":
                         color_name = color_map[unit_target]
                         result = color_blocks_position_WL(img0, color_name, 2000, img0)
                         if result:
-                            pos_x, pos_y = result
+                            measured_x, measured_y = result
+                            # 卡尔曼滤波降低抖动
+                            z = np.array([[measured_x], [measured_y]], dtype=np.float32)
+                            x = kalman_filter(z)
+                            pos_x = int(x[0][0])
+                            pos_y = int(x[1][0])
                             
                             send[1] = 0x02
                             send[2] = unit_target  # 颜色码
@@ -403,16 +422,21 @@ if __name__ == "__main__":
                         platform_result = find_specific_target(img0, color_name, 'PLATFORM')
                         if platform_result:
                             platform_pos, platform_contour = platform_result
+                            # 第二组滤波器专门平滑凸台位置
+                            z = np.array([[platform_pos[0]], [platform_pos[1]]], dtype=np.float32)
+                            pred = kalman_filter_2(z)
+                            px = int(pred[0][0])
+                            py = int(pred[1][0])
                             
                             send[1] = 0x0A
-                            send[2] = (platform_pos[0] & 0xff00) >> 8
-                            send[3] = (platform_pos[0] & 0xff)
-                            send[4] = (platform_pos[1] & 0xff00) >> 8
-                            send[5] = (platform_pos[1] & 0xff)
+                            send[2] = (px & 0xff00) >> 8
+                            send[3] = (px & 0xff)
+                            send[4] = (py & 0xff00) >> 8
+                            send[5] = (py & 0xff)
                             send[6] = 0x77
                             FH = bytearray(send)
                             write_len = ser.write(FH)
-                            print(f"{color_name}凸台坐标: {platform_pos}")
+                            print(f"{color_name}凸台坐标: ({px}, {py})")
                             print(send)
                 except:
                     pass
@@ -426,16 +450,21 @@ if __name__ == "__main__":
                         slot_result = find_specific_target(img0, color_name, 'SLOT')
                         if slot_result:
                             slot_pos, slot_contour = slot_result
+                            # 第三组滤波器专门平滑凹槽位置
+                            z = np.array([[slot_pos[0]], [slot_pos[1]]], dtype=np.float32)
+                            pred = kalman_filter_3(z)
+                            sx = int(pred[0][0])
+                            sy = int(pred[1][0])
                             
                             send[1] = 0x0B
-                            send[2] = (slot_pos[0] & 0xff00) >> 8
-                            send[3] = (slot_pos[0] & 0xff)
-                            send[4] = (slot_pos[1] & 0xff00) >> 8
-                            send[5] = (slot_pos[1] & 0xff)
+                            send[2] = (sx & 0xff00) >> 8
+                            send[3] = (sx & 0xff)
+                            send[4] = (sy & 0xff00) >> 8
+                            send[5] = (sy & 0xff)
                             send[6] = 0x77
                             FH = bytearray(send)
                             write_len = ser.write(FH)
-                            print(f"{color_name}凹槽坐标: {slot_pos}")
+                            print(f"{color_name}凹槽坐标: ({sx}, {sy})")
                             print(send)
                 except:
                     pass
