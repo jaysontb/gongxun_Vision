@@ -56,9 +56,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-    choices=["block", "platform", "slot", "circular"],
+        choices=["block", "platform", "slot"],
         default="platform",
-    help="检测目标类型：block=色块物料，platform=凸台，slot=凹槽，circular=同时检测凸台+凹槽；默认进行凸台检测，可通过 --mode 指定",
+        help="检测目标类型：block=色块物料，platform=凸台，slot=凹槽；默认进行凸台检测，可通过 --mode 指定",
     )
     parser.add_argument(
         "--colors",
@@ -100,29 +100,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="使用真实串口（默认使用模拟串口，适合本地PC测试）",
     )
-    parser.add_argument(
-        "--radius-min",
-        type=int,
-        default=None,
-        help="手动设定圆检测的最小像素半径（覆盖默认 COMMON 配置）",
-    )
-    parser.add_argument(
-        "--radius-max",
-        type=int,
-        default=None,
-        help="手动设定圆检测的最大像素半径（覆盖默认 COMMON 配置）",
-    )
-    parser.add_argument(
-        "--radius-margin-scale",
-        type=float,
-        default=None,
-        help="调整半径自适应时的弹性比例，例如 0.3/0.6，默认 0.5",
-    )
-    parser.add_argument(
-        "--disable-radius-adapt",
-        action="store_true",
-        help="关闭基于掩膜面积的半径自适应，仅使用静态配置",
-    )
     return parser.parse_args()
 
 
@@ -138,19 +115,6 @@ def main() -> None:
 
     creama.DEBUG_VISUAL = args.debug_visual
     creama.DEBUG_LOG = args.debug_log
-
-    if args.radius_min is not None:
-        creama.CIRCULAR_TARGET_PARAMS["COMMON"]["min_radius"] = max(4, args.radius_min)
-    if args.radius_max is not None:
-        creama.CIRCULAR_TARGET_PARAMS["COMMON"]["max_radius"] = max(
-            creama.CIRCULAR_TARGET_PARAMS["COMMON"]["min_radius"] + 2, args.radius_max
-        )
-
-    if args.radius_margin_scale is not None:
-        creama.RADIUS_MARGIN_SCALE = max(0.1, float(args.radius_margin_scale))
-
-    if args.disable_radius_adapt:
-        creama.ENABLE_RADIUS_ADAPT = False
 
     cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW if sys.platform.startswith("win") else 0)
     if not cap.isOpened():
@@ -178,17 +142,16 @@ def main() -> None:
     smoothing_alpha = 0.35
     smoothed_positions: Dict[str, Tuple[float, float]] = {}
 
-    def smooth_center(track_key: str, raw_center: Tuple[int, int]) -> Tuple[int, int]:
-        """统一的中心点指数平滑器，track_key 可区分颜色与目标类型。"""
-        previous = smoothed_positions.get(track_key)
+    def smooth_center(color: str, raw_center: Tuple[int, int]) -> Tuple[int, int]:
+        previous = smoothed_positions.get(color)
         if previous is None:
-            smoothed_positions[track_key] = (float(raw_center[0]), float(raw_center[1]))
+            smoothed_positions[color] = (float(raw_center[0]), float(raw_center[1]))
         else:
-            smoothed_positions[track_key] = (
+            smoothed_positions[color] = (
                 (1 - smoothing_alpha) * previous[0] + smoothing_alpha * raw_center[0],
                 (1 - smoothing_alpha) * previous[1] + smoothing_alpha * raw_center[1],
             )
-        smoothed = smoothed_positions[track_key]
+        smoothed = smoothed_positions[color]
         return int(round(smoothed[0])), int(round(smoothed[1]))
 
     try:
@@ -200,15 +163,14 @@ def main() -> None:
 
             display_frame = frame.copy()
             detections = {}
-            overlay_lines = []  # 收集文本叠加信息 (label, center, color BGR)
+            overlay_lines = []
 
             if args.mode == "block":
                 for color in colors:
                     center = creama.color_blocks_position_WL(frame, color, args.size_threshold, display_frame)
                     if center:
-                        track_key = color
-                        smoothed_center_point = smooth_center(track_key, center)
-                        detections[track_key] = smoothed_center_point
+                        smoothed_center_point = smooth_center(color, center)
+                        detections[color] = smoothed_center_point
                         cv2.circle(display_frame, smoothed_center_point, 8, color_styles[color], -1)
                         cv2.putText(
                             display_frame,
@@ -220,9 +182,9 @@ def main() -> None:
                             2,
                             cv2.LINE_AA,
                         )
-                        overlay_lines.append((color, smoothed_center_point, color_styles[color]))
+                        overlay_lines.append((color, smoothed_center_point))
                     else:
-                        overlay_lines.append((color, None, color_styles[color]))
+                        overlay_lines.append((color, None))
             elif args.mode in type_map:
                 target_label = type_map[args.mode]
                 for color in colors:
@@ -233,9 +195,8 @@ def main() -> None:
                     )
                     if detection:
                         center, contour = detection
-                        track_key = f"{args.mode}-{color}"
-                        smoothed_center_point = smooth_center(track_key, center)
-                        detections[track_key] = smoothed_center_point
+                        smoothed_center_point = smooth_center(color, center)
+                        detections[color] = smoothed_center_point
                         draw_color = color_styles.get(color, (0, 255, 255))
                         cv2.drawContours(display_frame, [contour], -1, draw_color, 2)
                         cv2.circle(display_frame, smoothed_center_point, 8, draw_color, -1)
@@ -249,42 +210,13 @@ def main() -> None:
                             2,
                             cv2.LINE_AA,
                         )
-                        overlay_lines.append((f"{args.mode}-{color}", smoothed_center_point, draw_color))
+                        overlay_lines.append((color, smoothed_center_point))
                     else:
-                        overlay_lines.append((f"{args.mode}-{color}", None, color_styles.get(color, (255, 255, 255))))
-            elif args.mode == "circular":
-                # 同一帧内先后检测凸台/凹槽，便于对比新圆检测逻辑
-                for target_label, readable in (("PLATFORM", "platform"), ("SLOT", "slot")):
-                    for color in colors:
-                        detection = creama.find_specific_target(frame, color, target_label)
-                        label_key = f"{readable}-{color}"
-                        draw_color = color_styles.get(color, (0, 255, 255))
-                        # 为了区分凸台/凹槽，凹槽使用更浅的描边颜色
-                        if target_label == "SLOT":
-                            draw_color = tuple(min(255, int(c * 1.2)) for c in draw_color)
-
-                        if detection:
-                            center, contour = detection
-                            smoothed_center_point = smooth_center(label_key, center)
-                            detections[label_key] = smoothed_center_point
-                            cv2.drawContours(display_frame, [contour], -1, draw_color, 2)
-                            cv2.circle(display_frame, smoothed_center_point, 8, draw_color, -1)
-                            cv2.putText(
-                                display_frame,
-                                f"{readable}:{color} {smoothed_center_point}",
-                                (smoothed_center_point[0] + 10, smoothed_center_point[1] - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.6,
-                                draw_color,
-                                2,
-                                cv2.LINE_AA,
-                            )
-                            overlay_lines.append((label_key, smoothed_center_point, draw_color))
-                        else:
-                            overlay_lines.append((label_key, None, draw_color))
+                        overlay_lines.append((color, None))
 
             line_y = 30
-            for label, center, bgr in overlay_lines:
+            for color, center in overlay_lines:
+                label = color if args.mode == "block" else f"{args.mode}-{color}"
                 text = f"{label:<15} {center if center else '未检测到'}"
                 cv2.putText(
                     display_frame,
@@ -292,7 +224,7 @@ def main() -> None:
                     (10, line_y),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
-                    bgr,
+                    color_styles.get(color, (255, 255, 255)),
                     2,
                     cv2.LINE_AA,
                 )
@@ -300,22 +232,12 @@ def main() -> None:
 
             now = time.time()
             if now - last_report >= args.print_interval:
-                if args.mode == "block":
-                    report_keys = colors
-                elif args.mode in ("platform", "slot"):
-                    report_keys = [f"{args.mode}-{color}" for color in colors]
-                elif args.mode == "circular":
-                    report_keys = [
-                        f"platform-{color}" for color in colors
-                    ] + [f"slot-{color}" for color in colors]
-                else:
-                    report_keys = list(detections.keys())
-
-                for key in report_keys:
-                    if key in detections:
-                        print(f"[{args.mode}] {key} center -> {detections[key]}")
+                report_colors = colors if args.mode in ("block", "platform", "slot") else list(detections.keys())
+                for color in report_colors:
+                    if color in detections:
+                        print(f"[{args.mode}] {color} center -> {detections[color]}")
                     else:
-                        print(f"[{args.mode}] {key}: 未检测到目标")
+                        print(f"[{args.mode}] {color}: 未检测到目标")
                 last_report = now
 
             cv2.imshow("vision_test", display_frame)
