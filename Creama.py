@@ -1,5 +1,4 @@
 import cv2
-import matplotlib as plt
 import numpy as np
 import serial as ser
 import serial
