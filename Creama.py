@@ -176,7 +176,7 @@ def uart_process():
                 unit_target = receive[2]
 
 # 直接创建串口对象 
-ser = serial.Serial(port="/dev/ttyS3", baudrate=115200, timeout=0.05)
+ser = serial.Serial(port="/dev/ttyS3", baudrate=115200, timeout=1.0)  # 1秒超时
 serial_thread = threading.Thread(target=uart_process)
 serial_thread.daemon = True
 serial_thread.start()
