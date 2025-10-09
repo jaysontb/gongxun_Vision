@@ -28,7 +28,7 @@ _MASK_KERNEL_CLOSE = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
 # 如果赛场光照非常稳定，可以关闭 ENABLE_SHADOW_SUPPRESSION 以节省算力。
 ENABLE_SHADOW_SUPPRESSION = True
 # V 通道(亮度)小于该阈值的像素会被视为阴影，随后从红色掩膜中剔除。
-SHADOW_V_THRESHOLD = 100
+SHADOW_V_THRESHOLD = 110
 # 用于净化阴影掩膜的小椭圆核，既能去掉孤立噪点也能保留阴影主干。若现场光线低，可灵活下调
 _SHADOW_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 # CLAHE 参数：clipLimit 控制对比度增强强度，tileGridSize 决定局部自适应区域大小。
@@ -189,7 +189,7 @@ BLOCK_AREA_MIN= 32000      # 物块最小面积
 BLOCK_AREA_MAX= 58000      # 物块最大面积
 
 # --- HSV颜色阈值 ---
-color_thresholds = {'red': {'Lower1': np.array([170, 120, 120]), 'Upper1': np.array([180, 255, 255]),'Lower2': np.array([0, 120, 120]), 'Upper2': np.array([20, 255, 255])},
+color_thresholds = {'red': {'Lower1': np.array([170, 100, 90]), 'Upper1': np.array([180, 255, 255]),'Lower2': np.array([0, 100, 90]), 'Upper2': np.array([20, 255, 255])},
               'blue': {'Lower': np.array([100, 140, 110]), 'Upper': np.array([124, 255, 255])},
               'green': {'Lower': np.array([38, 100, 60]), 'Upper': np.array([90, 255, 255])},
               }
@@ -613,39 +613,114 @@ if __name__ == "__main__":
         elif unit == 9:
             try:
                 log_debug("[UART] 收到指令: unit=9 (二维码识别)")
+
+                # 打开固定的二维码摄像头(索引10)
+                # 使用 CAP_V4L2 后端避免 GStreamer 警告
+                cap_qr = cv2.VideoCapture(10, cv2.CAP_V4L2)
                 
-                # 使用OpenCV的QR码检测器
-                qrDecoder = cv2.QRCodeDetector()
-                
-                # 检测并解码二维码
-                # 返回: (数据字符串, 边界框坐标, 矫正后的图像)
-                data, bbox, _ = qrDecoder.detectAndDecode(img0)
-                
-                if data and bbox is not None:
-                    print(f"[UART] 检测到二维码: '{data}'")
-                    
-                    # 在画面上绘制边界框和中心点(用于调试)
-                    if DEBUG_VISUAL:
-                        display(img0, bbox)
-                        cv2.imshow("QR Detection", img0)
-                    
-                    # 构造串口发送数据包
-                    # 假设二维码数据格式为: "123RGB" (6个字符)
-                    send[1] = 0x09  # 指令码: 二维码识别
-                    send[2] = ord(data[0]) if len(data) > 0 else 0
-                    send[3] = ord(data[1]) if len(data) > 1 else 0
-                    send[4] = ord(data[2]) if len(data) > 2 else 0
-                    send[5] = ord(data[3]) if len(data) > 3 else 0
-                    send[6] = ord(data[4]) if len(data) > 4 else 0
-                    send[7] = ord(data[5]) if len(data) > 5 else 0
-                    send[8] = 0x77
-                    
-                    FH = bytearray(send[:9])
+                # 设置摄像头参数以提高稳定性
+                if cap_qr.isOpened():
+                    cap_qr.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # 减小缓冲区，获取最新帧
+                    cap_qr.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    cap_qr.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+                if not cap_qr.isOpened():
+                    print("[ERROR] 无法打开摄像头10用于二维码扫描")
+                    send[1] = 0xAA
+                    send[2] = 0x09
+                    send[3] = 0x77
+                    FH = bytearray(send[:4])
                     ser.write(FH)
-                    
-                    print(f"[UART] 发送QR数据: {list(FH)}")
                 else:
-                    log_debug("[WARN] 未检测到二维码")
+                    # 预热: 先丢弃更多帧, 等待曝光和自动对焦稳定
+                    # GStreamer 后端需要更长的预热时间
+                    for _ in range(15):
+                        ret = cap_qr.grab()  # 使用 grab() 更快速地丢弃帧
+                        if not ret:
+                            break
+                    time.sleep(0.1)  # 增加延时确保摄像头完全就绪
+
+                    data = ""
+                    bbox = None
+                    img_qr = None
+                    detection_success = False
+
+                    # 连续尝试更多帧, 提高检测成功率
+                    for attempt in range(50):
+                        success_qr, frame_qr = cap_qr.read()
+                        if not success_qr or frame_qr is None:
+                            continue
+
+                        # 使用 pyzbar 进行二维码检测
+                        decoded_objects = decode(frame_qr)
+                        
+                        if decoded_objects:
+                            # 取第一个检测到的二维码
+                            obj = decoded_objects[0]
+                            data = obj.data.decode('utf-8')
+                            # 将 pyzbar 的 polygon 转换为 numpy 数组格式
+                            bbox = np.array(obj.polygon).reshape(-1, 2)
+                            img_qr = frame_qr
+                            detection_success = True
+                            log_debug(f"[INFO] QR检测成功于第 {attempt+1} 次尝试")
+                            break
+                        
+                        # 短暂延时避免CPU占用过高
+                        time.sleep(0.02)
+
+                    if detection_success:
+                        print(f"[UART] 检测到二维码: '{data}'")
+
+                        # 在画面上绘制边界框和中心点(用于调试)
+                        if DEBUG_VISUAL:
+                            display(img_qr, bbox)
+                            cv2.imshow("QR Detection", img_qr)
+                            cv2.waitKey(1000)  # 显示1秒
+
+                        # 解析二维码内容并确定装配模式
+                        # 比赛规则: 任务码1="同色装配", 任务码2="异色错配"
+                        assembly_mode = 0x00
+
+                        # 方案1: 二维码直接包含"1"或"2"
+                        if '1' in data or '同色' in data or 'SAME' in data.upper():
+                            assembly_mode = 0x01  # 同色装配
+                        elif '2' in data or '异色' in data or 'DIFF' in data.upper():
+                            assembly_mode = 0x02  # 异色错配
+                        else:
+                            # 尝试解析第一个字符为数字
+                            try:
+                                mode_num = int(data[0])
+                                if mode_num == 1:
+                                    assembly_mode = 0x01
+                                elif mode_num == 2:
+                                    assembly_mode = 0x02
+                            except:
+                                assembly_mode = 0xFF  # 无法识别
+
+                        # 构造串口发送数据包
+                        send[1] = 0x09              # 指令码: 二维码识别
+                        send[2] = assembly_mode     # 装配模式: 0x01=同色, 0x02=异色
+                        send[3] = 0x77              # 结束标志
+
+                        FH = bytearray(send[:4])
+                        ser.write(FH)
+
+                        mode_text = "同色装配" if assembly_mode == 0x01 else "异色错配" if assembly_mode == 0x02 else "未知"
+                        print(f"[UART] QR识别结果: {mode_text} (0x{assembly_mode:02X})")
+                        print(f"[UART] 发送数据: {list(FH)}")
+                    else:
+                        log_debug("[WARN] 未检测到二维码")
+                        # 发送未检测到的响应
+                        send[1] = 0x09
+                        send[2] = 0xFF  # 标记为未检测到
+                        send[3] = 0x77
+                        FH = bytearray(send[:4])
+                        ser.write(FH)
+                    
+                    # 释放二维码摄像头
+                    cap_qr.release()
+                    if DEBUG_VISUAL:
+                        cv2.destroyWindow("QR Detection")
                     
             except Exception as exc:
                 log_debug(f"[ERROR][unit=9] 二维码识别失败: {exc}")

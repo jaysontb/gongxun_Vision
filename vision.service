@@ -1,0 +1,35 @@
+[Unit]
+Description=Vision Recognition Service for Competition
+After=network.target multi-user.target
+Wants=network.target
+
+[Service]
+# 服务类型: simple表示主进程不会fork
+Type=simple
+
+# 使用root用户运行(与sudo python3一致)
+User=root
+Group=root
+
+# 工作目录(Creama.py所在目录)
+WorkingDirectory=/home/cat
+
+# 启动命令
+ExecStart=/bin/bash /home/cat/vision_service.sh
+
+# 失败后自动重启
+Restart=on-failure
+RestartSec=10s
+
+# 启动超时时间
+TimeoutStartSec=60s
+
+# 标准输出和错误输出重定向到日志
+StandardOutput=append:/var/log/vision/vision.log
+StandardError=append:/var/log/vision/vision_error.log
+
+# 环境变量(可选)
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target
